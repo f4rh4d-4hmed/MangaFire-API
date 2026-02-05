@@ -1,5 +1,5 @@
 """
-MangaFire API - Python implementation based on Kotlin version
+MangaFire API - Python implementation based on Kotlin version at https://github.com/yuzono/tachiyomi-extensions
 FastAPI-based manga reader API for MangaFire.to
 """
 
@@ -258,8 +258,8 @@ class VRFHelper:
     
     _browser = None
     _context = None
-    _vrf_cache = {}  # Cache VRF tokens
-    _search_vrf_cache = {}  # Cache search VRF tokens
+    _vrf_cache = {}
+    _search_vrf_cache = {}
     
     @classmethod
     async def get_browser(cls):
@@ -329,19 +329,11 @@ class VRFHelper:
                         vrf_token = params['vrf'][0]
             
             page.on("request", handle_request)
-            
-            # Navigate to home page
             await page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30000)
-            
-            # Wait for page to load
             await page.wait_for_timeout(1000)
-            
-            # Type in search box to trigger VRF generation
             search_input = page.locator(".search-inner input[name=keyword]")
             await search_input.fill(query)
             await search_input.press("Enter")
-            
-            # Wait for the ajax request to be made
             for _ in range(10):
                 if vrf_token:
                     break
@@ -378,7 +370,6 @@ class VRFHelper:
         pages_data = None
         
         try:
-            # Intercept requests to capture the pages ajax call
             async def handle_request(request):
                 nonlocal ajax_url
                 url = request.url
