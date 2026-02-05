@@ -1,0 +1,22 @@
+# MangaFire API Requirements
+
+# Web Framework
+fastapi>=0.109.0
+
+# ASGI Server
+uvicorn[standard]>=0.27.0
+
+# HTTP Client
+aiohttp>=3.9.0
+
+# HTML Parsing
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Headless Browser for VRF bypass
+playwright>=1.40.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+httpx>=0.26.0
