@@ -106,7 +106,7 @@ class TestSearchEndpoint:
     
     def test_search_with_query(self):
         """Test search with keyword"""
-        response = test_client.get("/search", params={"query": "one piece", "use_browser": "false"})
+        response = test_client.get("/search", params={"query": "Boruto", "use_browser": "false"})
         # Note: Keyword search may return 403 due to Cloudflare protection
         assert response.status_code in [200, 403, 500]
         if response.status_code == 200:
@@ -471,65 +471,140 @@ def test_live_search_pagination():
     return response1.status_code == 200 and response2.status_code == 200
 
 
-def test_live_chapters(manga_id: str = "one-piecee.dkw"):
-    """Test chapters endpoint"""
-    print_header(f"9. Get Chapters - GET /manga/{manga_id}/chapters?language=en")
-    response = requests.get(f"{LIVE_API_URL}/manga/{manga_id}/chapters", params={
-        "language": "en"
-    })
-    print(f"Status: {response.status_code}")
+def test_live_chapters():
+    """Test chapters - Search -> Select first -> Get languages -> Get chapters -> Get pages"""
+    print_header("9. Dynamic Chapter Test")
     
-    if response.status_code == 200:
-        data = response.json()
-        print(f"Manga ID: {data['manga_id']}")
-        print(f"Language: {data['language']}")
-        print(f"Total chapters: {len(data['chapters'])}")
-        print("\nFirst 5 chapters:")
-        for chapter in data['chapters'][:5]:
-            print(f"  - {chapter['name']} (#{chapter['number']})")
-        return True, data
-    else:
-        print(f"Error: {response.text}")
+    # Step 1: Search (simple, no filters)
+    print("\n[Step 1] Searching manga...")
+    search_response = requests.get(f"{LIVE_API_URL}/search")
+    
+    if search_response.status_code != 200:
+        print(f"  ✗ Search failed: {search_response.status_code}")
         return False, None
+    
+    search_data = search_response.json()
+    if not search_data['manga_list']:
+        print("  ✗ No manga found")
+        return False, None
+    
+    # Select first result
+    selected_manga = search_data['manga_list'][0]
+    manga_slug = selected_manga['url'].strip('/').split('/')[-1]
+    print(f"  ✓ Found {len(search_data['manga_list'])} manga")
+    print(f"  ✓ Selected: {selected_manga['title']}")
+    
+    # Step 2: Get available languages
+    print("\n[Step 2] Getting languages...")
+    lang_response = requests.get(f"{LIVE_API_URL}/languages")
+    
+    if lang_response.status_code != 200:
+        print(f"  ✗ Failed to get languages")
+        return False, None
+    
+    languages = lang_response.json()['languages']
+    selected_language = languages[0] if languages else "en"
+    print(f"  ✓ Available: {', '.join(languages)}")
+    print(f"  ✓ Using: {selected_language}")
+    
+    # Step 3: Get chapters
+    print(f"\n[Step 3] Getting chapters...")
+    chapters_response = requests.get(f"{LIVE_API_URL}/manga/{manga_slug}/chapters", params={
+        "language": selected_language
+    })
+    
+    if chapters_response.status_code != 200:
+        print(f"  ✗ Failed: {chapters_response.status_code}")
+        return False, None
+    
+    chapters_data = chapters_response.json()
+    print(f"  ✓ Manga: {chapters_data['manga_id']}")
+    print(f"  ✓ Language: {chapters_data['language']}")
+    print(f"  ✓ Chapters: {len(chapters_data['chapters'])}")
+    
+    if chapters_data['chapters']:
+        print("\n  First 3 chapters:")
+        for chapter in chapters_data['chapters'][:3]:
+            print(f"    - {chapter['name']}")
+    
+    # Step 4: Get pages
+    if chapters_data['chapters']:
+        print("\n[Step 4] Getting pages...")
+        first_chapter = chapters_data['chapters'][0]
+        chapter_url = first_chapter['url'].strip('/')
+        print(f"  Chapter: {first_chapter['name']}")
+        
+        pages_response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=60)
+        
+        if pages_response.status_code == 200:
+            pages_data = pages_response.json()
+            print(f"  ✓ Pages: {len(pages_data['pages'])}")
+            scrambled = sum(1 for p in pages_data['pages'] if p['is_scrambled'])
+            print(f"  ✓ Scrambled: {scrambled}")
+        else:
+            print(f"  ✗ Failed: {pages_response.status_code}")
+    
+    return True, chapters_data
 
 
-def test_live_chapters_japanese(manga_id: str = "one-piecee.dkw"):
-    """Test chapters in Japanese"""
-    print_header(f"10. Get Chapters (Japanese) - GET /manga/{manga_id}/chapters?language=ja")
-    response = requests.get(f"{LIVE_API_URL}/manga/{manga_id}/chapters", params={
-        "language": "ja"
+def test_live_chapters_with_language(language: str = "ja"):
+    """Test chapters with different language"""
+    print_header(f"10. Get Chapters (Language: {language})")
+    
+    # Search and get first manga
+    search_response = requests.get(f"{LIVE_API_URL}/search")
+    if search_response.status_code != 200 or not search_response.json()['manga_list']:
+        print("  ✗ Could not find manga")
+        return False
+    
+    manga_slug = search_response.json()['manga_list'][0]['url'].strip('/').split('/')[-1]
+    print(f"Using: {manga_slug}")
+    
+    response = requests.get(f"{LIVE_API_URL}/manga/{manga_slug}/chapters", params={
+        "language": language
     })
     print(f"Status: {response.status_code}")
     
     if response.status_code == 200:
         data = response.json()
         print(f"Language: {data['language']}")
-        print(f"Total chapters: {len(data['chapters'])}")
+        print(f"Chapters: {len(data['chapters'])}")
         if data['chapters']:
-            print("\nFirst 3 chapters:")
+            print("\nFirst 3:")
             for chapter in data['chapters'][:3]:
                 print(f"  - {chapter['name']}")
     return response.status_code == 200
 
 
-def test_live_pages(chapter_url: str = "read/one-piecee.dkw/en/chapter-1"):
-    """Test pages endpoint (requires browser)"""
-    print_header(f"11. Get Pages - GET /chapter/{chapter_url}/pages")
-    print("Note: This uses headless browser for VRF bypass (may take a few seconds)")
+def test_live_pages():
+    """Test pages - search, get chapters, get pages"""
+    print_header("11. Get Pages (Dynamic)")
+    
+    # Search and get first manga
+    search_response = requests.get(f"{LIVE_API_URL}/search")
+    if search_response.status_code != 200 or not search_response.json()['manga_list']:
+        print("  ✗ Could not find manga")
+        return False
+    
+    manga_slug = search_response.json()['manga_list'][0]['url'].strip('/').split('/')[-1]
+    
+    # Get chapters
+    chapters_response = requests.get(f"{LIVE_API_URL}/manga/{manga_slug}/chapters")
+    if chapters_response.status_code != 200 or not chapters_response.json()['chapters']:
+        print("  ✗ Could not get chapters")
+        return False
+    
+    chapter_url = chapters_response.json()['chapters'][0]['url'].strip('/')
+    print(f"Chapter: {chapter_url}")
     
     response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=60)
     print(f"Status: {response.status_code}")
     
     if response.status_code == 200:
         data = response.json()
-        print(f"Chapter ID: {data['chapter_id']}")
-        print(f"Total pages: {len(data['pages'])}")
+        print(f"Pages: {len(data['pages'])}")
         scrambled = sum(1 for p in data['pages'] if p['is_scrambled'])
-        print(f"Scrambled pages: {scrambled}")
-        print("\nFirst 3 page URLs:")
-        for page in data['pages'][:3]:
-            scramble_info = f" (scrambled, offset={page['scramble_offset']})" if page['is_scrambled'] else ""
-            print(f"  Page {page['index'] + 1}: {page['url'][:60]}...{scramble_info}")
+        print(f"Scrambled: {scrambled}")
         return True
     else:
         print(f"Response: {response.text[:200]}")
@@ -690,8 +765,8 @@ def run_live_tests():
         ("Search Browse", lambda: test_live_search_browse()[0]),
         ("Search with Filters", test_live_search_with_filters),
         ("Search Pagination", test_live_search_pagination),
-        ("Chapters (EN)", lambda: test_live_chapters()[0]),
-        ("Chapters (JA)", test_live_chapters_japanese),
+        ("Chapters (Dynamic)", lambda: test_live_chapters()[0]),
+        ("Chapters (JA)", lambda: test_live_chapters_with_language(language="ja")),
         ("Error: Invalid Manga", test_live_error_invalid_manga),
         ("Error: Not Found", test_live_error_not_found),
         ("Error: Invalid Chapter", test_live_error_invalid_chapter),

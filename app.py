@@ -15,8 +15,18 @@ from datetime import datetime
 from io import BytesIO
 import math
 import asyncio
+import threading
 import json
+import logging
 from urllib.parse import urlparse, parse_qs, urlencode
+
+# Configure logging for page fetching diagnostics
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('mangafire.pages')
+logger.setLevel(logging.DEBUG)
 
 # Optional PIL support for image descrambling
 try:
@@ -26,8 +36,24 @@ except ImportError:
     PIL_AVAILABLE = False
 
 # Playwright for headless browser VRF bypass
+#
+# Uses sync_api + asyncio.to_thread() instead of async_api because:
+#   1. async_playwright().start() calls asyncio.create_subprocess_exec() which
+#      fails with NotImplementedError on Windows where uvicorn forces
+#      SelectorEventLoop (it does not support subprocess creation).
+#   2. The original code stored the playwright instance as a local variable
+#      inside get_browser(), so close_browser() could never call
+#      playwright.stop() — leaking Node.js driver subprocesses on every
+#      browser restart (affects ALL platforms).
+#   3. No concurrency guard on get_browser() meant parallel requests could
+#      race and create duplicate browser instances.
+#
+# sync_api avoids all three issues: subprocess spawning goes through the
+# normal subprocess module (works on any event loop), the instance is
+# stored as a class attribute, and a threading.Lock serialises init.
+#
 try:
-    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -254,25 +280,34 @@ class VRFHelper:
     Helper class to extract VRF tokens using headless browser.
     MangaFire uses VRF tokens for search and page requests to prevent scraping.
     This mimics the WebView approach used in the Kotlin version.
+
+    All Playwright work is done through the **sync** API inside a worker thread
+    (via asyncio.to_thread) so that:
+      - The browser subprocess is spawned outside the async event loop
+        (fixing Windows NotImplementedError).
+      - The Playwright instance is properly tracked and stopped on cleanup
+        (fixing Node.js subprocess leaks).
+      - A threading.Lock prevents duplicate initialisation from concurrent
+        requests.
     """
-    
+
+    _lock = threading.Lock()
+    _playwright = None
     _browser = None
     _context = None
     _vrf_cache = {}
     _search_vrf_cache = {}
-    
+
+    # ---- low-level sync helpers (run inside a worker thread) ----
+
     @classmethod
-    async def get_browser(cls):
-        """Get or create browser instance"""
-        if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
-            )
-        
-        if cls._browser is None:
-            playwright = await async_playwright().start()
-            cls._browser = await playwright.chromium.launch(
+    def _ensure_browser_sync(cls):
+        """Ensure the sync browser/context is initialised (called in thread)."""
+        with cls._lock:
+            if cls._browser is not None:
+                return
+            cls._playwright = sync_playwright().start()
+            cls._browser = cls._playwright.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -285,41 +320,35 @@ class VRFHelper:
                     '--single-process',
                 ]
             )
-            cls._context = await cls._browser.new_context(
+            cls._context = cls._browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True
             )
-        return cls._browser, cls._context
-    
+
     @classmethod
-    async def close_browser(cls):
-        """Close browser instance"""
-        if cls._context:
-            await cls._context.close()
-            cls._context = None
-        if cls._browser:
-            await cls._browser.close()
-            cls._browser = None
-    
+    def _close_browser_sync(cls):
+        """Close browser and Playwright driver (called in thread)."""
+        with cls._lock:
+            if cls._context:
+                cls._context.close()
+                cls._context = None
+            if cls._browser:
+                cls._browser.close()
+                cls._browser = None
+            if cls._playwright:
+                cls._playwright.stop()
+                cls._playwright = None
+
     @classmethod
-    async def get_search_vrf(cls, query: str) -> str:
-        """
-        Get VRF token for search query using headless browser.
-        Mimics the Kotlin WebView approach.
-        """
-        # Check cache first
-        if query in cls._search_vrf_cache:
-            return cls._search_vrf_cache[query]
-        
-        browser, context = await cls.get_browser()
-        page = await context.new_page()
-        
+    def _get_search_vrf_sync(cls, query: str) -> str:
+        """Blocking VRF extraction for a search query."""
+        cls._ensure_browser_sync()
+        page = cls._context.new_page()
         vrf_token = None
-        
+
         try:
-            # Intercept requests to capture the VRF token
-            async def handle_request(request):
+            def handle_request(request):
                 nonlocal vrf_token
                 url = request.url
                 if "mangafire.to" in url and "ajax/manga/search" in url:
@@ -327,108 +356,193 @@ class VRFHelper:
                     params = parse_qs(parsed.query)
                     if 'vrf' in params:
                         vrf_token = params['vrf'][0]
-            
+
             page.on("request", handle_request)
-            await page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(1000)
+            page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(1000)
             search_input = page.locator(".search-inner input[name=keyword]")
-            await search_input.fill(query)
-            await search_input.press("Enter")
+            search_input.fill(query)
+            search_input.press("Enter")
             for _ in range(10):
                 if vrf_token:
                     break
-                await page.wait_for_timeout(500)
-            
+                page.wait_for_timeout(500)
+
             if vrf_token:
-                # Cache for 5 minutes
                 cls._search_vrf_cache[query] = vrf_token
-                # Limit cache size
                 if len(cls._search_vrf_cache) > 20:
-                    # Remove oldest entry
                     oldest_key = next(iter(cls._search_vrf_cache))
                     del cls._search_vrf_cache[oldest_key]
-        
+
         except PlaywrightTimeout:
             pass
         except Exception as e:
             print(f"VRF extraction error: {e}")
         finally:
-            await page.close()
-        
+            page.close()
+
         return vrf_token
-    
+
     @classmethod
-    async def get_chapter_pages_vrf(cls, chapter_url: str) -> tuple:
-        """
-        Get pages data for a chapter using headless browser.
-        Returns (ajax_url, pages_data) tuple.
-        """
-        browser, context = await cls.get_browser()
-        page = await context.new_page()
+    def _get_chapter_pages_vrf_sync(cls, chapter_url: str) -> tuple:
+        """Blocking chapter-pages VRF extraction."""
+        logger.info(f"[VRF] Starting chapter pages extraction for: {chapter_url}")
         
+        try:
+            cls._ensure_browser_sync()
+            logger.debug("[VRF] Browser initialized successfully")
+        except Exception as e:
+            logger.error(f"[VRF] Failed to initialize browser: {e}")
+            return None, None
+            
+        page = cls._context.new_page()
+        logger.debug("[VRF] New browser page created")
         ajax_url = None
         pages_data = None
-        
+        request_count = 0
+        response_count = 0
+
         try:
-            async def handle_request(request):
-                nonlocal ajax_url
+            def handle_request(request):
+                nonlocal ajax_url, request_count
+                request_count += 1
                 url = request.url
                 if "mangafire.to" in url and "ajax/read" in url:
+                    logger.debug(f"[VRF] Intercepted ajax/read request: {url}")
                     if "/chapter/" in url or "/volume/" in url:
                         ajax_url = url
-            
-            async def handle_response(response):
-                nonlocal pages_data
+                        logger.info(f"[VRF] Captured chapter/volume AJAX URL: {url}")
+
+            def handle_response(response):
+                nonlocal pages_data, response_count
+                response_count += 1
                 url = response.url
+                status = response.status
                 if "mangafire.to" in url and "ajax/read" in url:
+                    logger.debug(f"[VRF] Intercepted ajax/read response: {url} (status: {status})")
                     if "/chapter/" in url or "/volume/" in url:
                         try:
-                            data = await response.json()
+                            data = response.json()
+                            logger.debug(f"[VRF] Response JSON keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
                             if "result" in data:
                                 pages_data = data
-                        except:
-                            pass
-            
+                                images_count = len(data.get('result', {}).get('images', []))
+                                logger.info(f"[VRF] Successfully captured pages data with {images_count} images")
+                            else:
+                                logger.warning(f"[VRF] Response has no 'result' key. Keys: {list(data.keys()) if isinstance(data, dict) else data}")
+                        except Exception as json_err:
+                            logger.error(f"[VRF] Failed to parse response JSON: {json_err}")
+
             page.on("request", handle_request)
             page.on("response", handle_response)
-            
-            # Build full URL
+
             full_url = chapter_url if chapter_url.startswith("http") else f"{BASE_URL}{chapter_url}"
+            logger.info(f"[VRF] Navigating to: {full_url}")
             
-            # Navigate to chapter page
-            await page.goto(full_url, wait_until="networkidle", timeout=30000)
+            page.goto(full_url, wait_until="networkidle", timeout=30000)
+            logger.debug(f"[VRF] Page loaded (networkidle). Requests: {request_count}, Responses: {response_count}")
             
-            # Wait for ajax request to complete
-            for _ in range(15):
+            # Check page title and content for error detection
+            page_title = page.title()
+            logger.debug(f"[VRF] Page title: {page_title}")
+            
+            # Wait for pages data with logging
+            for i in range(15):
                 if pages_data:
+                    logger.info(f"[VRF] Pages data captured after {i * 500}ms")
                     break
-                await page.wait_for_timeout(500)
-        
-        except PlaywrightTimeout:
-            pass
+                logger.debug(f"[VRF] Waiting for pages data... attempt {i + 1}/15")
+                page.wait_for_timeout(500)
+            
+            if not pages_data:
+                logger.warning(f"[VRF] No pages data captured after 7.5s. Total requests: {request_count}, responses: {response_count}")
+                # Try to capture any error messages on the page
+                try:
+                    error_elem = page.query_selector('.error, .not-found, [class*="error"]')
+                    if error_elem:
+                        error_text = error_elem.inner_text()
+                        logger.warning(f"[VRF] Page error element found: {error_text[:200]}")
+                except Exception:
+                    pass
+
+        except PlaywrightTimeout as timeout_err:
+            logger.error(f"[VRF] Playwright timeout: {timeout_err}")
         except Exception as e:
-            print(f"Chapter pages extraction error: {e}")
+            logger.error(f"[VRF] Chapter pages extraction error: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(f"[VRF] Traceback: {traceback.format_exc()}")
         finally:
-            await page.close()
-        
+            page.close()
+            logger.debug("[VRF] Browser page closed")
+
+        logger.info(f"[VRF] Extraction complete. ajax_url: {ajax_url is not None}, pages_data: {pages_data is not None}")
         return ajax_url, pages_data
-    
+
+    @classmethod
+    def _get_page_with_cloudflare_bypass_sync(cls, url: str) -> str:
+        """Blocking Cloudflare-bypass page fetch."""
+        cls._ensure_browser_sync()
+        page = cls._context.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            return page.content()
+        except Exception as e:
+            raise RuntimeError(f"Browser fetch failed: {e}")
+        finally:
+            page.close()
+
+    # ---- public async interface (delegates to thread) ----
+
+    @classmethod
+    async def get_browser(cls):
+        """Ensure browser is started (async wrapper)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise HTTPException(
+                status_code=501,
+                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
+            )
+        await asyncio.to_thread(cls._ensure_browser_sync)
+        return cls._browser, cls._context
+
+    @classmethod
+    async def close_browser(cls):
+        """Close browser instance (async wrapper)."""
+        await asyncio.to_thread(cls._close_browser_sync)
+
+    @classmethod
+    async def get_search_vrf(cls, query: str) -> str:
+        """Get VRF token for a search query (async wrapper)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise HTTPException(
+                status_code=501,
+                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
+            )
+        if query in cls._search_vrf_cache:
+            return cls._search_vrf_cache[query]
+        return await asyncio.to_thread(cls._get_search_vrf_sync, query)
+
+    @classmethod
+    async def get_chapter_pages_vrf(cls, chapter_url: str) -> tuple:
+        """Get pages data for a chapter (async wrapper)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise HTTPException(
+                status_code=501,
+                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
+            )
+        return await asyncio.to_thread(cls._get_chapter_pages_vrf_sync, chapter_url)
+
     @classmethod
     async def get_page_with_cloudflare_bypass(cls, url: str) -> str:
-        """
-        Fetch a page with Cloudflare bypass using headless browser.
-        """
-        browser, context = await cls.get_browser()
-        page = await context.new_page()
-        
+        """Fetch a page with Cloudflare bypass (async wrapper)."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise HTTPException(
+                status_code=501,
+                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
+            )
         try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            content = await page.content()
-            return content
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Browser fetch failed: {e}")
-        finally:
-            await page.close()
+            return await asyncio.to_thread(cls._get_page_with_cloudflare_bypass_sync, url)
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== API Client ====================
@@ -728,25 +842,36 @@ class MangaFireClient:
     
     async def get_pages(self, chapter_id: str, chapter_type: str = "chapter", use_browser: bool = True) -> PageList:
         """Get pages for a chapter using headless browser for VRF bypass"""
+        logger.info(f"[PAGES] get_pages called - chapter_id: {chapter_id}, type: {chapter_type}, use_browser: {use_browser}")
         
         # Clean up the chapter_id to build chapter URL
         chapter_id = chapter_id.strip("/")
+        logger.debug(f"[PAGES] Cleaned chapter_id: {chapter_id}")
         
         # Build full chapter URL
         if not chapter_id.startswith("read"):
             chapter_url = f"/read/{chapter_id}"
         else:
             chapter_url = f"/{chapter_id}"
+        logger.debug(f"[PAGES] Built chapter_url: {chapter_url}")
         
         # First try using headless browser (recommended - bypasses VRF)
         if use_browser and PLAYWRIGHT_AVAILABLE:
+            logger.info(f"[PAGES] Attempting browser-based VRF bypass for: {chapter_url}")
             ajax_url, pages_data = await VRFHelper.get_chapter_pages_vrf(chapter_url)
             
+            logger.debug(f"[PAGES] VRF result - ajax_url: {ajax_url}, pages_data present: {pages_data is not None}")
+            
             if pages_data and "result" in pages_data:
+                logger.info(f"[PAGES] Successfully retrieved pages via browser")
                 return self._parse_pages(pages_data["result"], chapter_id)
+            else:
+                logger.warning(f"[PAGES] Browser method returned no valid pages_data")
         
         # Fallback: Try direct API calls (may fail without VRF)
+        logger.info(f"[PAGES] Falling back to direct API calls (no VRF)")
         parts = chapter_id.split("/")
+        logger.debug(f"[PAGES] URL parts: {parts}")
         
         # Find manga ID (contains a dot)
         manga_slug = None
@@ -780,48 +905,70 @@ class MangaFireClient:
                     break
         
         if not manga_slug:
+            logger.error(f"[PAGES] Could not parse manga_slug from chapter_id: {chapter_id}")
             raise HTTPException(status_code=400, detail=f"Could not parse chapter URL: {chapter_id}")
         
+        logger.debug(f"[PAGES] Parsed - manga_slug: {manga_slug}, lang: {lang}, chap_num: {chap_num}")
         manga_numeric_id = manga_slug.split(".")[-1] if "." in manga_slug else manga_slug
+        logger.debug(f"[PAGES] manga_numeric_id: {manga_numeric_id}")
         
         # Build ajax URL for pages - format: /ajax/read/{manga_id}/{type}/{lang}/{chapter_num}
         url = f"{self.base_url}/ajax/read/{manga_numeric_id}/{chapter_type}/{lang}/{chap_num}"
+        logger.info(f"[PAGES] Trying direct AJAX URL (with type): {url}")
         
         try:
             data = await self._fetch_json(url)
+            logger.debug(f"[PAGES] Direct API response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
             if "result" in data:
+                logger.info(f"[PAGES] Direct API call successful")
                 return self._parse_pages(data["result"], chapter_id)
+            else:
+                logger.warning(f"[PAGES] Direct API response has no 'result' key")
         except Exception as e:
-            pass
+            logger.warning(f"[PAGES] Direct API call failed: {type(e).__name__}: {e}")
         
         # Try alternative URL format without chapter type
         url = f"{self.base_url}/ajax/read/{manga_numeric_id}/{lang}/{chap_num}"
+        logger.info(f"[PAGES] Trying alternative AJAX URL (no type): {url}")
         try:
             data = await self._fetch_json(url)
+            logger.debug(f"[PAGES] Alternative API response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
             if "result" in data:
+                logger.info(f"[PAGES] Alternative API call successful")
                 return self._parse_pages(data["result"], chapter_id)
-        except Exception:
-            pass
+            else:
+                logger.warning(f"[PAGES] Alternative API response has no 'result' key")
+        except Exception as e:
+            logger.warning(f"[PAGES] Alternative API call failed: {type(e).__name__}: {e}")
         
         # If browser available but not used, suggest enabling it
         if PLAYWRIGHT_AVAILABLE and not use_browser:
+            logger.error(f"[PAGES] No pages found - browser not used. Suggest enabling use_browser=true")
             raise HTTPException(
                 status_code=404, 
                 detail="No pages found. Try with use_browser=true for VRF bypass."
             )
         elif not PLAYWRIGHT_AVAILABLE:
+            logger.error(f"[PAGES] No pages found - Playwright not available")
             raise HTTPException(
                 status_code=501, 
                 detail="Pages require VRF token. Install playwright: pip install playwright && playwright install chromium"
             )
         else:
+            logger.error(f"[PAGES] No pages found for chapter after all methods: {chapter_id}")
             raise HTTPException(status_code=404, detail=f"No pages found for chapter: {chapter_id}")
     
     def _parse_pages(self, result: dict, chapter_id: str) -> PageList:
         """Parse pages from API response"""
+        logger.debug(f"[PAGES] Parsing pages from result. Result keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
         pages = []
         
         images = result.get("images", [])
+        logger.debug(f"[PAGES] Found {len(images)} images in result")
+        
+        if not images:
+            logger.warning(f"[PAGES] No images found in result. Full result: {str(result)[:500]}")
+        
         for idx, img_data in enumerate(images):
             if isinstance(img_data, list) and len(img_data) >= 3:
                 url = img_data[0]
@@ -835,7 +982,12 @@ class MangaFireClient:
                     is_scrambled=is_scrambled,
                     scramble_offset=offset if isinstance(offset, int) else 0
                 ))
+                if idx == 0:
+                    logger.debug(f"[PAGES] First image - url: {url[:80]}..., scrambled: {is_scrambled}, offset: {offset}")
+            else:
+                logger.warning(f"[PAGES] Unexpected image data format at index {idx}: {type(img_data)} - {str(img_data)[:100]}")
         
+        logger.info(f"[PAGES] Successfully parsed {len(pages)} pages for chapter: {chapter_id}")
         return PageList(pages=pages, chapter_id=chapter_id)
 
 
@@ -1006,11 +1158,18 @@ async def get_pages(
     - **type**: 'chapter' for chapters, 'volume' for volumes
     - **use_browser**: Use headless browser to bypass VRF (default: true, recommended)
     """
+    logger.info(f"[ENDPOINT] /chapter/{{chapter_id}}/pages - chapter_id: {chapter_id}, type: {type}, use_browser: {use_browser}")
     try:
-        return await client.get_pages(chapter_id, type, use_browser)
-    except HTTPException:
+        result = await client.get_pages(chapter_id, type, use_browser)
+        logger.info(f"[ENDPOINT] Successfully returned {len(result.pages)} pages")
+        return result
+    except HTTPException as http_exc:
+        logger.error(f"[ENDPOINT] HTTPException: {http_exc.status_code} - {http_exc.detail}")
         raise
     except Exception as e:
+        logger.error(f"[ENDPOINT] Unexpected error: {type(e).__name__}: {e}")
+        import traceback
+        logger.debug(f"[ENDPOINT] Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
