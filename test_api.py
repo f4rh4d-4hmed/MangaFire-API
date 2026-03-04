@@ -781,19 +781,18 @@ def run_live_tests():
             print(f"\n❌ Error in {name}: {e}")
             results.append((name, False))
     
-    # Ask user if they want to run full workflow (includes browser)
+    # Automatically run full workflow test (includes browser)
     print("\n" + "=" * 70)
-    print("Do you want to run the full workflow test? (includes headless browser)")
-    print("This will take ~10-30 seconds...")
+    print("Running full workflow test (includes headless browser)...")
+    print("This may take ~10-30 seconds...")
+    print("=" * 70)
     
     try:
-        answer = input("Run full workflow? [y/N]: ").strip().lower()
-        if answer == 'y':
-            workflow_result = test_live_full_workflow()
-            results.append(("Full Workflow", workflow_result))
-    except EOFError:
-        # Non-interactive mode
-        pass
+        workflow_result = test_live_full_workflow()
+        results.append(("Full Workflow", workflow_result))
+    except Exception as e:
+        print(f"\n❌ Error in Full Workflow: {e}")
+        results.append(("Full Workflow", False))
     
     # Summary
     print("\n")

@@ -289,6 +289,9 @@ class VRFHelper:
         (fixing Node.js subprocess leaks).
       - A threading.Lock prevents duplicate initialisation from concurrent
         requests.
+    
+    VRF Cache: Uses a size-limited dict (max 20 entries) matching Kotlin's
+    LinkedHashMap behavior with automatic removal of eldest entries.
     """
 
     _lock = threading.Lock()
@@ -297,12 +300,21 @@ class VRFHelper:
     _context = None
     _vrf_cache = {}
     _search_vrf_cache = {}
+    _MAX_CACHE_SIZE = 20  # Match Kotlin's cache size limit
 
     # ---- low-level sync helpers (run inside a worker thread) ----
 
     @classmethod
     def _ensure_browser_sync(cls):
-        """Ensure the sync browser/context is initialised (called in thread)."""
+        """Ensure the sync browser/context is initialised (called in thread).
+        
+        Note: The browser allows specific resource loading to match Kotlin WebViewHelper:
+        1. Main page URL (chapter page)
+        2. Scripts from mfcdn.cc (MangaFire CDN)
+        3. jQuery scripts from cloudflare.com
+        4. Specific AJAX requests based on intercept callback
+        All other requests should be blocked for performance.
+        """
         with cls._lock:
             if cls._browser is not None:
                 return
@@ -370,7 +382,9 @@ class VRFHelper:
 
             if vrf_token:
                 cls._search_vrf_cache[query] = vrf_token
-                if len(cls._search_vrf_cache) > 20:
+                # Enforce cache size limit (matching Kotlin's LinkedHashMap with max 20 entries)
+                if len(cls._search_vrf_cache) > cls._MAX_CACHE_SIZE:
+                    # Remove oldest entry
                     oldest_key = next(iter(cls._search_vrf_cache))
                     del cls._search_vrf_cache[oldest_key]
 
@@ -407,9 +421,11 @@ class VRFHelper:
                 nonlocal ajax_url, request_count
                 request_count += 1
                 url = request.url
+                # Match Kotlin logic: capture specific ajax/read/chapter or ajax/read/volume paths
                 if "mangafire.to" in url and "ajax/read" in url:
                     logger.debug(f"[VRF] Intercepted ajax/read request: {url}")
-                    if "/chapter/" in url or "/volume/" in url:
+                    # Check for specific chapter/volume paths
+                    if "ajax/read/chapter" in url or "ajax/read/volume" in url:
                         ajax_url = url
                         logger.info(f"[VRF] Captured chapter/volume AJAX URL: {url}")
 
@@ -418,9 +434,11 @@ class VRFHelper:
                 response_count += 1
                 url = response.url
                 status = response.status
+                # Match Kotlin logic: process specific ajax/read/chapter or ajax/read/volume responses
                 if "mangafire.to" in url and "ajax/read" in url:
                     logger.debug(f"[VRF] Intercepted ajax/read response: {url} (status: {status})")
-                    if "/chapter/" in url or "/volume/" in url:
+                    # Check for specific chapter/volume paths
+                    if "ajax/read/chapter" in url or "ajax/read/volume" in url:
                         try:
                             data = response.json()
                             logger.debug(f"[VRF] Response JSON keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
@@ -717,46 +735,80 @@ class MangaFireClient:
         poster = main.select_one(".poster img")
         thumbnail = poster.get("src") if poster else None
         
-        # Status
+        # Status parsing - match Kotlin logic
+        # MangaFire marks manga as "completed" when original publication is completed
+        # even if translation is not complete
         status_elem = main.select_one(".info > p")
-        status = status_elem.get_text(strip=True).lower() if status_elem else None
+        status_text = status_elem.get_text(strip=True).lower() if status_elem else None
         
-        # Description
+        # Map status to match Kotlin logic
+        status_map = {
+            "releasing": "ongoing",
+            "completed": "publishing_finished",
+            "on_hiatus": "on_hiatus",
+            "discontinued": "cancelled"
+        }
+        status = status_map.get(status_text, status_text) if status_text else None
+        
+        # Description with alternative title appended (matching Kotlin)
+        description_parts = []
         synopsis = soup.select_one("#synopsis .modal-content")
-        description = synopsis.get_text(strip=True) if synopsis else None
+        if synopsis:
+            # Get text nodes (matching Kotlin's textNodes approach)
+            synopsis_text = synopsis.get_text(separator="\n\n", strip=True)
+            if synopsis_text:
+                description_parts.append(synopsis_text)
         
         # Alternative title
         alt_title_elem = main.select_one("h6")
-        alt_title = alt_title_elem.get_text(strip=True) if alt_title_elem else None
+        if alt_title_elem:
+            alt_title = alt_title_elem.get_text(strip=True)
+            description_parts.append(f"Alternative title: {alt_title}")
+        else:
+            alt_title = None
         
-        # Meta info
+        description = "\n\n".join(description_parts) if description_parts else None
+        
+        # Meta info - improved extraction matching Kotlin
         meta = main.select_one(".meta")
         author = None
+        type_info = None
         genres = []
         
         if meta:
-            author_elem = meta.select_one("span:contains('Author:') + span")
-            if not author_elem:
-                # Alternative approach
-                for span in meta.select("span"):
-                    if "Author" in span.get_text():
-                        next_span = span.find_next_sibling("span")
-                        if next_span:
-                            author = next_span.get_text(strip=True)
-                            break
-            else:
-                author = author_elem.get_text(strip=True)
+            # Extract author
+            for span in meta.select("span"):
+                text = span.get_text(strip=True)
+                if "Author" in text or "author" in text.lower():
+                    next_span = span.find_next_sibling("span")
+                    if next_span:
+                        author = next_span.get_text(strip=True)
+                    break
             
-            genres_elem = meta.select_one("span:contains('Genres:') + span")
-            if not genres_elem:
-                for span in meta.select("span"):
-                    if "Genres" in span.get_text():
-                        next_span = span.find_next_sibling("span")
-                        if next_span:
-                            genres = [g.strip() for g in next_span.get_text().split(",")]
-                            break
-            else:
-                genres = [g.strip() for g in genres_elem.get_text().split(",")]
+            # Extract type
+            for span in meta.select("span"):
+                text = span.get_text(strip=True)
+                if "Type" in text or "type" in text.lower():
+                    next_span = span.find_next_sibling("span")
+                    if next_span:
+                        type_info = next_span.get_text(strip=True)
+                    break
+            
+            # Extract genres
+            for span in meta.select("span"):
+                text = span.get_text(strip=True)
+                if "Genres" in text or "genres" in text.lower():
+                    next_span = span.find_next_sibling("span")
+                    if next_span:
+                        genres_text = next_span.get_text(strip=True)
+                        genres = [g.strip() for g in genres_text.split(",") if g.strip()]
+                    break
+            
+            # Combine type and genres (matching Kotlin's genre field logic)
+            if type_info and genres:
+                genres = [type_info] + genres
+            elif type_info:
+                genres = [type_info]
         
         return MangaDetails(
             id=manga_id,
@@ -804,6 +856,7 @@ class MangaFireClient:
         soup = BeautifulSoup(html, "lxml")
         
         chapters = []
+        # Match Kotlin selectors
         selector = ".vol-list > .item" if chapter_type == "volume" else "li"
         
         for item in soup.select(selector):
@@ -820,8 +873,31 @@ class MangaFireClient:
                 number = -1
             
             spans = item.select("span")
-            name = spans[0].get_text(strip=True) if spans else f"Chapter {number}"
+            # First span contains the name
+            name_elem = spans[0] if spans else None
+            # Second span contains the date
             date_str = spans[1].get_text(strip=True) if len(spans) > 1 else None
+            
+            # Build chapter name with better formatting (matching Kotlin logic)
+            if name_elem:
+                raw_name = name_elem.get_text(strip=True)
+                # Kotlin uses abbreviated prefix in data, full prefix in display
+                abbr_prefix = "Vol" if chapter_type == "volume" else "Chap"
+                full_prefix = "Volume" if chapter_type == "volume" else "Chapter"
+                prefix = f"{abbr_prefix} {number_str}: "
+                
+                # If name starts with abbreviated prefix, replace with full
+                if raw_name.startswith(prefix):
+                    real_name = raw_name[len(prefix):]
+                    # Only use full prefix if the number isn't already in the name
+                    if number_str not in real_name:
+                        name = f"{full_prefix} {number_str}: {real_name}"
+                    else:
+                        name = real_name
+                else:
+                    name = raw_name
+            else:
+                name = f"{'Volume' if chapter_type == 'volume' else 'Chapter'} {number}"
             
             # Extract chapter ID from URL
             chapter_id = url.split("/")[-1] if "/" in url else url
@@ -1064,8 +1140,8 @@ async def search_manga(
     genres: Optional[str] = Query(default=None, description="Comma-separated genres"),
     genre_mode: Optional[str] = Query(default=None, description="Genre mode: 'and' or 'or'"),
     status: Optional[str] = Query(default=None, description="Comma-separated status"),
-    year: Optional[str] = Query(default=None, description="Comma-separated years"),
-    min_chapters: Optional[int] = Query(default=None, ge=0, description="Minimum chapters"),
+    year: Optional[str] = Query(default=None, description="Comma-separated years (e.g., 2024, 2023 or decades like 1990s, 1980s)"),
+    min_chapters: Optional[int] = Query(default=None, ge=1, description="Minimum chapters (must be > 0)"),
     sort: str = Query(default="most_relevance", description="Sort order"),
     use_browser: bool = Query(default=True, description="Use headless browser for VRF bypass (keyword search)")
 ):
@@ -1079,8 +1155,8 @@ async def search_manga(
     - **genres**: Comma-separated genres (action, adventure, comedy, etc.)
     - **genre_mode**: 'and' to require all genres, 'or' for any (default)
     - **status**: Comma-separated status (completed, releasing, on_hiatus, discontinued)
-    - **year**: Comma-separated years
-    - **min_chapters**: Minimum number of chapters
+    - **year**: Comma-separated years (e.g., 2024, 2023 or decades like 1990s, 1980s)
+    - **min_chapters**: Minimum number of chapters (must be > 0)
     - **sort**: Sort order (most_viewed, recently_updated, etc.)
     - **use_browser**: Use headless browser to bypass VRF (default: true)
     """
