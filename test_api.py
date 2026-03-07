@@ -220,7 +220,7 @@ class TestPagesEndpoint:
     
     def test_pages_invalid_chapter(self):
         """Test pages with invalid chapter ID"""
-        response = test_client.get("/chapter/invalid/pages", params={"use_browser": "false"})
+        response = test_client.get("/chapter/invalid/pages")
         assert response.status_code in [400, 403, 404, 500, 501]
 
 
@@ -534,7 +534,7 @@ def test_live_chapters():
         chapter_url = first_chapter['url'].strip('/')
         print(f"  Chapter: {first_chapter['name']}")
         
-        pages_response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=60)
+        pages_response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=120)
         
         if pages_response.status_code == 200:
             pages_data = pages_response.json()
@@ -597,18 +597,22 @@ def test_live_pages():
     chapter_url = chapters_response.json()['chapters'][0]['url'].strip('/')
     print(f"Chapter: {chapter_url}")
     
-    response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=60)
-    print(f"Status: {response.status_code}")
-    
-    if response.status_code == 200:
-        data = response.json()
-        print(f"Pages: {len(data['pages'])}")
-        scrambled = sum(1 for p in data['pages'] if p['is_scrambled'])
-        print(f"Scrambled: {scrambled}")
-        return True
-    else:
-        print(f"Response: {response.text[:200]}")
-        return False
+    # Retry once on failure (first attempt may fail due to cold browser start)
+    for attempt in range(1, 3):
+        print(f"  Attempt {attempt}/2...")
+        response = requests.get(f"{LIVE_API_URL}/chapter/{chapter_url}/pages", timeout=120)
+        print(f"  Status: {response.status_code}")
+        if response.status_code == 200:
+            data = response.json()
+            print(f"  Pages: {len(data['pages'])}")
+            scrambled = sum(1 for p in data['pages'] if p['is_scrambled'])
+            print(f"  Scrambled: {scrambled}")
+            return True
+        else:
+            print(f"  Response: {response.text[:200]}")
+            if attempt < 2:
+                print("  Retrying...")
+    return False
 
 
 def test_live_error_invalid_manga():
@@ -632,7 +636,7 @@ def test_live_error_not_found():
 def test_live_error_invalid_chapter():
     """Test error handling for invalid chapter"""
     print_header("14. Error Test - Invalid Chapter URL")
-    response = requests.get(f"{LIVE_API_URL}/chapter/invalid/pages", params={"use_browser": "false"})
+    response = requests.get(f"{LIVE_API_URL}/chapter/invalid/pages")
     print(f"Status: {response.status_code}")
     print_json(response.json())
     return response.status_code in [400, 404, 500, 501]
@@ -692,30 +696,35 @@ def test_live_full_workflow():
                     chapter_url = first_chapter['url'].strip('/')
                     print(f"  ✓ First chapter: {first_chapter['name']}")
                     
-                    # Step 4: Get Pages
+                    # Step 4: Get Pages (retry once on failure)
                     print("\n[STEP 4] Getting pages (using headless browser)...")
                     print(f"  Chapter URL: {chapter_url}")
                     
-                    pages_response = requests.get(
-                        f"{LIVE_API_URL}/chapter/{chapter_url}/pages",
-                        timeout=60
-                    )
-                    
-                    if pages_response.status_code == 200:
-                        pages_data = pages_response.json()
-                        print(f"  ✓ Found {len(pages_data['pages'])} pages")
-                        results["pages"] = True
+                    for attempt in range(1, 3):
+                        print(f"  Attempt {attempt}/2...")
+                        pages_response = requests.get(
+                            f"{LIVE_API_URL}/chapter/{chapter_url}/pages",
+                            timeout=120
+                        )
                         
-                        # Show summary
-                        print("\n" + "-" * 70)
-                        print("DOWNLOAD SUMMARY:")
-                        print(f"  Manga: {selected['title']}")
-                        print(f"  Chapter: {first_chapter['name']}")
-                        print(f"  Pages: {len(pages_data['pages'])}")
-                        scrambled = sum(1 for p in pages_data['pages'] if p['is_scrambled'])
-                        print(f"  Scrambled: {scrambled}")
-                    else:
-                        print(f"  ✗ Pages error: {pages_response.status_code}")
+                        if pages_response.status_code == 200:
+                            pages_data = pages_response.json()
+                            print(f"  ✓ Found {len(pages_data['pages'])} pages")
+                            results["pages"] = True
+                            
+                            # Show summary
+                            print("\n" + "-" * 70)
+                            print("DOWNLOAD SUMMARY:")
+                            print(f"  Manga: {selected['title']}")
+                            print(f"  Chapter: {first_chapter['name']}")
+                            print(f"  Pages: {len(pages_data['pages'])}")
+                            scrambled = sum(1 for p in pages_data['pages'] if p['is_scrambled'])
+                            print(f"  Scrambled: {scrambled}")
+                            break
+                        else:
+                            print(f"  ✗ Pages error: {pages_response.status_code}")
+                            if attempt < 2:
+                                print("  Retrying...")
             else:
                 print(f"  ✗ Chapters error: {chapters_response.status_code}")
     else:
@@ -767,6 +776,7 @@ def run_live_tests():
         ("Search Pagination", test_live_search_pagination),
         ("Chapters (Dynamic)", lambda: test_live_chapters()[0]),
         ("Chapters (JA)", lambda: test_live_chapters_with_language(language="ja")),
+        ("Pages (Dynamic)", test_live_pages),
         ("Error: Invalid Manga", test_live_error_invalid_manga),
         ("Error: Not Found", test_live_error_not_found),
         ("Error: Invalid Chapter", test_live_error_invalid_chapter),

@@ -317,7 +317,20 @@ class VRFHelper:
         """
         with cls._lock:
             if cls._browser is not None:
-                return
+                # Check if browser is still alive
+                try:
+                    cls._browser.contexts  # will throw if browser crashed
+                    return
+                except Exception:
+                    logger.warning("[VRF] Browser crashed, restarting...")
+                    cls._browser = None
+                    cls._context = None
+                    if cls._playwright:
+                        try:
+                            cls._playwright.stop()
+                        except Exception:
+                            pass
+                        cls._playwright = None
             cls._playwright = sync_playwright().start()
             cls._browser = cls._playwright.chromium.launch(
                 headless=True,
@@ -329,7 +342,6 @@ class VRFHelper:
                     '--disable-gpu',
                     '--no-first-run',
                     '--no-zygote',
-                    '--single-process',
                 ]
             )
             cls._context = cls._browser.new_context(
@@ -398,103 +410,85 @@ class VRFHelper:
         return vrf_token
 
     @classmethod
-    def _get_chapter_pages_vrf_sync(cls, chapter_url: str) -> tuple:
-        """Blocking chapter-pages VRF extraction."""
-        logger.info(f"[VRF] Starting chapter pages extraction for: {chapter_url}")
-        
-        try:
-            cls._ensure_browser_sync()
-            logger.debug("[VRF] Browser initialized successfully")
-        except Exception as e:
-            logger.error(f"[VRF] Failed to initialize browser: {e}")
-            return None, None
-            
-        page = cls._context.new_page()
-        logger.debug("[VRF] New browser page created")
-        ajax_url = None
-        pages_data = None
-        request_count = 0
-        response_count = 0
+    def _get_chapter_pages_vrf_sync(cls, chapter_url: str) -> str:
+        """
+        Capture the VRF-protected AJAX URL for chapter pages.
+
+        Mirrors Kotlin fetchPageList + WebViewHelper.loadInWebView:
+          1. Load chapter page in a fresh browser context (like Kotlin's new WebView).
+          2. Route interception:
+             - mangafire.to ajax/read/chapter or ajax/read/volume → Capture
+             - mangafire.to other ajax/read                       → Allow
+             - mangafire.to (non-image resources)                 → Allow
+             - mfcdn.cc (non-image resources)                     → Allow
+             - cloudflare.com jQuery                              → Allow
+             - everything else                                    → Block
+          3. Return the captured URL (contains ?vrf= parameter).
+        """
+        cls._ensure_browser_sync()
+
+        # Fresh context per request — mirrors Kotlin creating a new WebView each time.
+        # This avoids stale Cloudflare cookies breaking subsequent requests.
+        context = cls._browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
+        captured_url = None
+        full_url = chapter_url if chapter_url.startswith("http") else f"{BASE_URL}{chapter_url}"
 
         try:
-            def handle_request(request):
-                nonlocal ajax_url, request_count
-                request_count += 1
+            def handle_route(route, request):
+                nonlocal captured_url
                 url = request.url
-                # Match Kotlin logic: capture specific ajax/read/chapter or ajax/read/volume paths
-                if "mangafire.to" in url and "ajax/read" in url:
-                    logger.debug(f"[VRF] Intercepted ajax/read request: {url}")
-                    # Check for specific chapter/volume paths
-                    if "ajax/read/chapter" in url or "ajax/read/volume" in url:
-                        ajax_url = url
-                        logger.info(f"[VRF] Captured chapter/volume AJAX URL: {url}")
+                rtype = request.resource_type
 
-            def handle_response(response):
-                nonlocal pages_data, response_count
-                response_count += 1
-                url = response.url
-                status = response.status
-                # Match Kotlin logic: process specific ajax/read/chapter or ajax/read/volume responses
-                if "mangafire.to" in url and "ajax/read" in url:
-                    logger.debug(f"[VRF] Intercepted ajax/read response: {url} (status: {status})")
-                    # Check for specific chapter/volume paths
-                    if "ajax/read/chapter" in url or "ajax/read/volume" in url:
-                        try:
-                            data = response.json()
-                            logger.debug(f"[VRF] Response JSON keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-                            if "result" in data:
-                                pages_data = data
-                                images_count = len(data.get('result', {}).get('images', []))
-                                logger.info(f"[VRF] Successfully captured pages data with {images_count} images")
-                            else:
-                                logger.warning(f"[VRF] Response has no 'result' key. Keys: {list(data.keys()) if isinstance(data, dict) else data}")
-                        except Exception as json_err:
-                            logger.error(f"[VRF] Failed to parse response JSON: {json_err}")
+                # mangafire.to ajax/read requests
+                if "mangafire.to" in url and "/ajax/read/" in url:
+                    if "/ajax/read/chapter/" in url or "/ajax/read/volume/" in url:
+                        if not captured_url:
+                            captured_url = url
+                        route.abort()          # Capture — don't need the response
+                    else:
+                        route.continue_()      # Allow (VRF generation flow)
+                    return
 
-            page.on("request", handle_request)
-            page.on("response", handle_response)
+                # mangafire.to — allow everything except images (Kotlin: blockNetworkImage)
+                if "mangafire.to" in url:
+                    route.abort() if rtype in ("image", "media", "font") else route.continue_()
+                    return
 
-            full_url = chapter_url if chapter_url.startswith("http") else f"{BASE_URL}{chapter_url}"
-            logger.info(f"[VRF] Navigating to: {full_url}")
-            
+                # CDN scripts
+                if "mfcdn.cc" in url:
+                    route.abort() if rtype in ("image", "media", "font") else route.continue_()
+                    return
+
+                # jQuery from cloudflare
+                if "cloudflare.com" in url and "jquery" in url.lower():
+                    route.continue_()
+                    return
+
+                # Block everything else
+                route.abort()
+
+            page.route("**/*", handle_route)
             page.goto(full_url, wait_until="networkidle", timeout=30000)
-            logger.debug(f"[VRF] Page loaded (networkidle). Requests: {request_count}, Responses: {response_count}")
-            
-            # Check page title and content for error detection
-            page_title = page.title()
-            logger.debug(f"[VRF] Page title: {page_title}")
-            
-            # Wait for pages data with logging
-            for i in range(15):
-                if pages_data:
-                    logger.info(f"[VRF] Pages data captured after {i * 500}ms")
+
+            # Wait up to 10s for the AJAX request to fire
+            for _ in range(20):
+                if captured_url:
                     break
-                logger.debug(f"[VRF] Waiting for pages data... attempt {i + 1}/15")
                 page.wait_for_timeout(500)
-            
-            if not pages_data:
-                logger.warning(f"[VRF] No pages data captured after 7.5s. Total requests: {request_count}, responses: {response_count}")
-                # Try to capture any error messages on the page
-                try:
-                    error_elem = page.query_selector('.error, .not-found, [class*="error"]')
-                    if error_elem:
-                        error_text = error_elem.inner_text()
-                        logger.warning(f"[VRF] Page error element found: {error_text[:200]}")
-                except Exception:
-                    pass
 
-        except PlaywrightTimeout as timeout_err:
-            logger.error(f"[VRF] Playwright timeout: {timeout_err}")
+        except PlaywrightTimeout:
+            logger.warning(f"[VRF] Timeout loading {full_url}")
         except Exception as e:
-            logger.error(f"[VRF] Chapter pages extraction error: {type(e).__name__}: {e}")
-            import traceback
-            logger.debug(f"[VRF] Traceback: {traceback.format_exc()}")
+            logger.error(f"[VRF] Error: {e}")
         finally:
-            page.close()
-            logger.debug("[VRF] Browser page closed")
+            context.close()
 
-        logger.info(f"[VRF] Extraction complete. ajax_url: {ajax_url is not None}, pages_data: {pages_data is not None}")
-        return ajax_url, pages_data
+        return captured_url
 
     @classmethod
     def _get_page_with_cloudflare_bypass_sync(cls, url: str) -> str:
@@ -540,8 +534,11 @@ class VRFHelper:
         return await asyncio.to_thread(cls._get_search_vrf_sync, query)
 
     @classmethod
-    async def get_chapter_pages_vrf(cls, chapter_url: str) -> tuple:
-        """Get pages data for a chapter (async wrapper)."""
+    async def get_chapter_pages_vrf(cls, chapter_url: str) -> str:
+        """
+        Get VRF-protected AJAX URL for chapter pages (async wrapper).
+        Returns the intercepted AJAX URL with VRF token, matching Kotlin behavior.
+        """
         if not PLAYWRIGHT_AVAILABLE:
             raise HTTPException(
                 status_code=501,
@@ -916,154 +913,53 @@ class MangaFireClient:
             language=language
         )
     
-    async def get_pages(self, chapter_id: str, chapter_type: str = "chapter", use_browser: bool = True) -> PageList:
-        """Get pages for a chapter using headless browser for VRF bypass"""
-        logger.info(f"[PAGES] get_pages called - chapter_id: {chapter_id}, type: {chapter_type}, use_browser: {use_browser}")
-        
-        # Clean up the chapter_id to build chapter URL
-        chapter_id = chapter_id.strip("/")
-        logger.debug(f"[PAGES] Cleaned chapter_id: {chapter_id}")
-        
-        # Build full chapter URL
-        if not chapter_id.startswith("read"):
-            chapter_url = f"/read/{chapter_id}"
-        else:
-            chapter_url = f"/{chapter_id}"
-        logger.debug(f"[PAGES] Built chapter_url: {chapter_url}")
-        
-        # First try using headless browser (recommended - bypasses VRF)
-        if use_browser and PLAYWRIGHT_AVAILABLE:
-            logger.info(f"[PAGES] Attempting browser-based VRF bypass for: {chapter_url}")
-            ajax_url, pages_data = await VRFHelper.get_chapter_pages_vrf(chapter_url)
-            
-            logger.debug(f"[PAGES] VRF result - ajax_url: {ajax_url}, pages_data present: {pages_data is not None}")
-            
-            if pages_data and "result" in pages_data:
-                logger.info(f"[PAGES] Successfully retrieved pages via browser")
-                return self._parse_pages(pages_data["result"], chapter_id)
-            else:
-                logger.warning(f"[PAGES] Browser method returned no valid pages_data")
-        
-        # Fallback: Try direct API calls (may fail without VRF)
-        logger.info(f"[PAGES] Falling back to direct API calls (no VRF)")
-        parts = chapter_id.split("/")
-        logger.debug(f"[PAGES] URL parts: {parts}")
-        
-        # Find manga ID (contains a dot)
-        manga_slug = None
-        lang = "en"
-        chap_num = "1"
-        
-        # Handle format: read/manga-slug.id/lang/chapter/chapter-num
-        # or: read/manga-slug.id/lang/chapter-num
-        if "read" in parts:
-            read_idx = parts.index("read")
-            if read_idx + 1 < len(parts):
-                manga_slug = parts[read_idx + 1]
-            if read_idx + 2 < len(parts):
-                lang = parts[read_idx + 2]
-            # Look for chapter number (last numeric part)
-            for part in reversed(parts):
-                if part.replace("-", "").replace("chapter", "").isdigit() or part.startswith("chapter-"):
-                    chap_num = part.replace("chapter-", "")
-                    break
-        else:
-            # Try to find manga slug from parts
-            for i, part in enumerate(parts):
-                if "." in part and any(c.isdigit() for c in part):
-                    manga_slug = part
-                    if i + 1 < len(parts):
-                        lang = parts[i + 1]
-                    if i + 3 < len(parts):
-                        chap_num = parts[i + 3]
-                    elif i + 2 < len(parts):
-                        chap_num = parts[i + 2].replace("chapter-", "")
-                    break
-        
-        if not manga_slug:
-            logger.error(f"[PAGES] Could not parse manga_slug from chapter_id: {chapter_id}")
-            raise HTTPException(status_code=400, detail=f"Could not parse chapter URL: {chapter_id}")
-        
-        logger.debug(f"[PAGES] Parsed - manga_slug: {manga_slug}, lang: {lang}, chap_num: {chap_num}")
-        manga_numeric_id = manga_slug.split(".")[-1] if "." in manga_slug else manga_slug
-        logger.debug(f"[PAGES] manga_numeric_id: {manga_numeric_id}")
-        
-        # Build ajax URL for pages - format: /ajax/read/{manga_id}/{type}/{lang}/{chapter_num}
-        url = f"{self.base_url}/ajax/read/{manga_numeric_id}/{chapter_type}/{lang}/{chap_num}"
-        logger.info(f"[PAGES] Trying direct AJAX URL (with type): {url}")
-        
-        try:
-            data = await self._fetch_json(url)
-            logger.debug(f"[PAGES] Direct API response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-            if "result" in data:
-                logger.info(f"[PAGES] Direct API call successful")
-                return self._parse_pages(data["result"], chapter_id)
-            else:
-                logger.warning(f"[PAGES] Direct API response has no 'result' key")
-        except Exception as e:
-            logger.warning(f"[PAGES] Direct API call failed: {type(e).__name__}: {e}")
-        
-        # Try alternative URL format without chapter type
-        url = f"{self.base_url}/ajax/read/{manga_numeric_id}/{lang}/{chap_num}"
-        logger.info(f"[PAGES] Trying alternative AJAX URL (no type): {url}")
-        try:
-            data = await self._fetch_json(url)
-            logger.debug(f"[PAGES] Alternative API response keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-            if "result" in data:
-                logger.info(f"[PAGES] Alternative API call successful")
-                return self._parse_pages(data["result"], chapter_id)
-            else:
-                logger.warning(f"[PAGES] Alternative API response has no 'result' key")
-        except Exception as e:
-            logger.warning(f"[PAGES] Alternative API call failed: {type(e).__name__}: {e}")
-        
-        # If browser available but not used, suggest enabling it
-        if PLAYWRIGHT_AVAILABLE and not use_browser:
-            logger.error(f"[PAGES] No pages found - browser not used. Suggest enabling use_browser=true")
+    async def get_pages(self, chapter_url: str) -> PageList:
+        """
+        Get pages for a chapter.  Mirrors Kotlin fetchPageList:
+          1. Use headless browser to capture ajax/read/chapter/{id}?vrf=... URL
+          2. Validate VRF token is present
+          3. HTTP GET the captured URL
+          4. Parse ResponseDto<PageListDto>  →  images: [[url, ?, offset], ...]
+        """
+        if not PLAYWRIGHT_AVAILABLE:
             raise HTTPException(
-                status_code=404, 
-                detail="No pages found. Try with use_browser=true for VRF bypass."
+                status_code=501,
+                detail="Pages require VRF token. Install playwright: pip install playwright && playwright install chromium",
             )
-        elif not PLAYWRIGHT_AVAILABLE:
-            logger.error(f"[PAGES] No pages found - Playwright not available")
-            raise HTTPException(
-                status_code=501, 
-                detail="Pages require VRF token. Install playwright: pip install playwright && playwright install chromium"
-            )
-        else:
-            logger.error(f"[PAGES] No pages found for chapter after all methods: {chapter_id}")
-            raise HTTPException(status_code=404, detail=f"No pages found for chapter: {chapter_id}")
-    
-    def _parse_pages(self, result: dict, chapter_id: str) -> PageList:
-        """Parse pages from API response"""
-        logger.debug(f"[PAGES] Parsing pages from result. Result keys: {list(result.keys()) if isinstance(result, dict) else 'not a dict'}")
+
+        # Build chapter path (matches Kotlin: "$baseUrl${chapter.url}")
+        chapter_url = chapter_url.strip("/")
+        chapter_path = f"/{chapter_url}" if chapter_url.startswith("read") else f"/read/{chapter_url}"
+
+        # Step 1 — capture VRF-protected AJAX URL via headless browser
+        ajax_url = await VRFHelper.get_chapter_pages_vrf(chapter_path)
+        if not ajax_url:
+            raise HTTPException(status_code=500, detail="Unable to capture AJAX URL for chapter pages")
+
+        # Step 2 — validate VRF (matches Kotlin: intercepted.toHttpUrl().queryParameter("vrf") == null)
+        if "vrf" not in parse_qs(urlparse(ajax_url).query):
+            raise HTTPException(status_code=500, detail="Unable to find vrf token")
+
+        # Step 3 — fetch page data (matches Kotlin: client.newCall(GET(intercepted, headers)))
+        data = await self._fetch_json(ajax_url)
+        if "result" not in data:
+            raise HTTPException(status_code=404, detail="No pages found in API response")
+
+        # Step 4 — parse images (matches Kotlin PageListDto)
+        return self._parse_pages(data["result"], chapter_url)
+
+    @staticmethod
+    def _parse_pages(result: dict, chapter_id: str) -> PageList:
+        """
+        Parse Kotlin's ResponseDto<PageListDto>:
+          images: [[url: str, ?, offset: int], ...]
+        """
         pages = []
-        
-        images = result.get("images", [])
-        logger.debug(f"[PAGES] Found {len(images)} images in result")
-        
-        if not images:
-            logger.warning(f"[PAGES] No images found in result. Full result: {str(result)[:500]}")
-        
-        for idx, img_data in enumerate(images):
-            if isinstance(img_data, list) and len(img_data) >= 3:
-                url = img_data[0]
-                offset = img_data[2] if len(img_data) > 2 else 0
-                
-                is_scrambled = offset > 0
-                
-                pages.append(Page(
-                    index=idx,
-                    url=url,
-                    is_scrambled=is_scrambled,
-                    scramble_offset=offset if isinstance(offset, int) else 0
-                ))
-                if idx == 0:
-                    logger.debug(f"[PAGES] First image - url: {url[:80]}..., scrambled: {is_scrambled}, offset: {offset}")
-            else:
-                logger.warning(f"[PAGES] Unexpected image data format at index {idx}: {type(img_data)} - {str(img_data)[:100]}")
-        
-        logger.info(f"[PAGES] Successfully parsed {len(pages)} pages for chapter: {chapter_id}")
+        for idx, img in enumerate(result.get("images", [])):
+            if isinstance(img, list) and len(img) >= 3:
+                url = img[0]
+                offset = img[2] if isinstance(img[2], int) else 0
+                pages.append(Page(index=idx, url=url, is_scrambled=offset > 0, scramble_offset=offset))
         return PageList(pages=pages, chapter_id=chapter_id)
 
 
@@ -1204,7 +1100,7 @@ async def get_manga_details(manga_id: str):
 async def get_chapters(
     manga_id: str,
     language: str = Query(default="en", description="Language code"),
-    type: str = Query(default="chapter", description="Type: 'chapter' or 'volume'")
+    chapter_type: str = Query(default="chapter", alias="type", description="Type: 'chapter' or 'volume'")
 ):
     """
     Get chapters for a manga
@@ -1214,7 +1110,7 @@ async def get_chapters(
     - **type**: 'chapter' for chapters, 'volume' for volumes
     """
     try:
-        return await client.get_chapters(manga_id, language, type)
+        return await client.get_chapters(manga_id, language, chapter_type)
     except HTTPException:
         raise
     except Exception as e:
@@ -1222,30 +1118,17 @@ async def get_chapters(
 
 
 @app.get("/chapter/{chapter_id:path}/pages", response_model=PageList, tags=["Pages"])
-async def get_pages(
-    chapter_id: str,
-    type: str = Query(default="chapter", description="Type: 'chapter' or 'volume'"),
-    use_browser: bool = Query(default=True, description="Use headless browser for VRF bypass")
-):
+async def get_pages(chapter_id: str):
     """
     Get pages for a chapter (uses headless browser for VRF bypass)
-    
-    - **chapter_id**: Chapter ID or URL path (e.g., 'read/one-piece.dkw/en/chapter-1')
-    - **type**: 'chapter' for chapters, 'volume' for volumes
-    - **use_browser**: Use headless browser to bypass VRF (default: true, recommended)
+
+    - **chapter_id**: Chapter URL path (e.g., 'read/one-piece.dkw/en/chapter-1')
     """
-    logger.info(f"[ENDPOINT] /chapter/{{chapter_id}}/pages - chapter_id: {chapter_id}, type: {type}, use_browser: {use_browser}")
     try:
-        result = await client.get_pages(chapter_id, type, use_browser)
-        logger.info(f"[ENDPOINT] Successfully returned {len(result.pages)} pages")
-        return result
-    except HTTPException as http_exc:
-        logger.error(f"[ENDPOINT] HTTPException: {http_exc.status_code} - {http_exc.detail}")
+        return await client.get_pages(chapter_id)
+    except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[ENDPOINT] Unexpected error: {type(e).__name__}: {e}")
-        import traceback
-        logger.debug(f"[ENDPOINT] Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
