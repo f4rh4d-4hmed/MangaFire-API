@@ -15,7 +15,6 @@ from datetime import datetime
 from io import BytesIO
 import math
 import asyncio
-import threading
 import json
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -37,23 +36,16 @@ except ImportError:
 
 # Playwright for headless browser VRF bypass
 #
-# Uses sync_api + asyncio.to_thread() instead of async_api because:
-#   1. async_playwright().start() calls asyncio.create_subprocess_exec() which
-#      fails with NotImplementedError on Windows where uvicorn forces
-#      SelectorEventLoop (it does not support subprocess creation).
-#   2. The original code stored the playwright instance as a local variable
-#      inside get_browser(), so close_browser() could never call
-#      playwright.stop() — leaking Node.js driver subprocesses on every
-#      browser restart (affects ALL platforms).
-#   3. No concurrency guard on get_browser() meant parallel requests could
-#      race and create duplicate browser instances.
+# Uses async_api directly on the event loop.  The original implementation
+# used sync_api + asyncio.to_thread(), but page.route() callbacks and
+# full JS-execution chains (needed for the VRF AJAX cascade) are silently
+# broken inside Playwright's sync API when called from a non-main thread.
 #
-# sync_api avoids all three issues: subprocess spawning goes through the
-# normal subprocess module (works on any event loop), the instance is
-# stored as a class attribute, and a threading.Lock serialises init.
+# async_api avoids those greenlet/thread-affinity issues entirely.
+# asyncio.Lock serialises browser init to prevent duplicate instances.
 #
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -277,49 +269,34 @@ class ImageDescrambler:
 # ==================== VRF Token Helper (Headless Browser) ====================
 class VRFHelper:
     """
-    Helper class to extract VRF tokens using headless browser.
-    MangaFire uses VRF tokens for search and page requests to prevent scraping.
-    This mimics the WebView approach used in the Kotlin version.
+    Extract VRF tokens using a headless browser (Playwright async API).
 
-    All Playwright work is done through the **sync** API inside a worker thread
-    (via asyncio.to_thread) so that:
-      - The browser subprocess is spawned outside the async event loop
-        (fixing Windows NotImplementedError).
-      - The Playwright instance is properly tracked and stopped on cleanup
-        (fixing Node.js subprocess leaks).
-      - A threading.Lock prevents duplicate initialisation from concurrent
-        requests.
-    
-    VRF Cache: Uses a size-limited dict (max 20 entries) matching Kotlin's
-    LinkedHashMap behavior with automatic removal of eldest entries.
+    MangaFire uses VRF tokens for search and page requests.
+    This mimics the WebView approach from the Kotlin Tachiyomi extension.
+
+    Uses async_api directly — sync_api page.route() callbacks are silently
+    broken inside non-main threads (the JS execution chain never completes).
+
+    VRF Cache: size-limited dict (max 20 entries) matching Kotlin's
+    LinkedHashMap behaviour.
     """
 
-    _lock = threading.Lock()
+    _lock = asyncio.Lock()
     _playwright = None
     _browser = None
     _context = None
-    _vrf_cache = {}
-    _search_vrf_cache = {}
-    _MAX_CACHE_SIZE = 20  # Match Kotlin's cache size limit
+    _search_vrf_cache: dict[str, str] = {}
+    _MAX_CACHE_SIZE = 20
 
-    # ---- low-level sync helpers (run inside a worker thread) ----
+    # ---- browser lifecycle ----
 
     @classmethod
-    def _ensure_browser_sync(cls):
-        """Ensure the sync browser/context is initialised (called in thread).
-        
-        Note: The browser allows specific resource loading to match Kotlin WebViewHelper:
-        1. Main page URL (chapter page)
-        2. Scripts from mfcdn.cc (MangaFire CDN)
-        3. jQuery scripts from cloudflare.com
-        4. Specific AJAX requests based on intercept callback
-        All other requests should be blocked for performance.
-        """
-        with cls._lock:
+    async def _ensure_browser(cls):
+        """Ensure the browser and context are initialised."""
+        async with cls._lock:
             if cls._browser is not None:
-                # Check if browser is still alive
                 try:
-                    cls._browser.contexts  # will throw if browser crashed
+                    cls._browser.contexts  # throws if browser crashed
                     return
                 except Exception:
                     logger.warning("[VRF] Browser crashed, restarting...")
@@ -327,12 +304,13 @@ class VRFHelper:
                     cls._context = None
                     if cls._playwright:
                         try:
-                            cls._playwright.stop()
+                            await cls._playwright.stop()
                         except Exception:
                             pass
                         cls._playwright = None
-            cls._playwright = sync_playwright().start()
-            cls._browser = cls._playwright.chromium.launch(
+
+            cls._playwright = await async_playwright().start()
+            cls._browser = await cls._playwright.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -342,33 +320,41 @@ class VRFHelper:
                     '--disable-gpu',
                     '--no-first-run',
                     '--no-zygote',
-                ]
+                ],
             )
-            cls._context = cls._browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            cls._context = await cls._browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
-                ignore_https_errors=True
+                ignore_https_errors=True,
             )
 
     @classmethod
-    def _close_browser_sync(cls):
-        """Close browser and Playwright driver (called in thread)."""
-        with cls._lock:
+    async def close_browser(cls):
+        """Close browser and Playwright driver."""
+        async with cls._lock:
             if cls._context:
-                cls._context.close()
+                await cls._context.close()
                 cls._context = None
             if cls._browser:
-                cls._browser.close()
+                await cls._browser.close()
                 cls._browser = None
             if cls._playwright:
-                cls._playwright.stop()
+                await cls._playwright.stop()
                 cls._playwright = None
 
+    # ---- search VRF ----
+
     @classmethod
-    def _get_search_vrf_sync(cls, query: str) -> str:
-        """Blocking VRF extraction for a search query."""
-        cls._ensure_browser_sync()
-        page = cls._context.new_page()
+    async def get_search_vrf(cls, query: str) -> str:
+        """Get VRF token for a keyword search."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise HTTPException(status_code=501, detail="Playwright not installed")
+        if query in cls._search_vrf_cache:
+            return cls._search_vrf_cache[query]
+
+        await cls._ensure_browser()
+        page = await cls._context.new_page()
         vrf_token = None
 
         try:
@@ -376,188 +362,124 @@ class VRFHelper:
                 nonlocal vrf_token
                 url = request.url
                 if "mangafire.to" in url and "ajax/manga/search" in url:
-                    parsed = urlparse(url)
-                    params = parse_qs(parsed.query)
+                    params = parse_qs(urlparse(url).query)
                     if 'vrf' in params:
                         vrf_token = params['vrf'][0]
 
             page.on("request", handle_request)
-            page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(1000)
+            await page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30000)
+            await page.wait_for_timeout(1000)
             search_input = page.locator(".search-inner input[name=keyword]")
-            search_input.fill(query)
-            search_input.press("Enter")
+            await search_input.fill(query)
+            await search_input.press("Enter")
+
             for _ in range(10):
                 if vrf_token:
                     break
-                page.wait_for_timeout(500)
+                await page.wait_for_timeout(500)
 
             if vrf_token:
                 cls._search_vrf_cache[query] = vrf_token
-                # Enforce cache size limit (matching Kotlin's LinkedHashMap with max 20 entries)
                 if len(cls._search_vrf_cache) > cls._MAX_CACHE_SIZE:
-                    # Remove oldest entry
                     oldest_key = next(iter(cls._search_vrf_cache))
                     del cls._search_vrf_cache[oldest_key]
 
         except PlaywrightTimeout:
             pass
         except Exception as e:
-            print(f"VRF extraction error: {e}")
+            logger.error(f"[VRF] Search VRF error: {e}")
         finally:
-            page.close()
+            await page.close()
 
         return vrf_token
 
-    @classmethod
-    def _get_chapter_pages_vrf_sync(cls, chapter_url: str) -> str:
-        """
-        Capture the VRF-protected AJAX URL for chapter pages.
-
-        Mirrors Kotlin fetchPageList + WebViewHelper.loadInWebView:
-          1. Load chapter page in a fresh browser context (like Kotlin's new WebView).
-          2. Route interception:
-             - mangafire.to ajax/read/chapter or ajax/read/volume → Capture
-             - mangafire.to other ajax/read                       → Allow
-             - mangafire.to (non-image resources)                 → Allow
-             - mfcdn.cc (non-image resources)                     → Allow
-             - cloudflare.com jQuery                              → Allow
-             - everything else                                    → Block
-          3. Return the captured URL (contains ?vrf= parameter).
-        """
-        cls._ensure_browser_sync()
-
-        # Fresh context per request — mirrors Kotlin creating a new WebView each time.
-        # This avoids stale Cloudflare cookies breaking subsequent requests.
-        context = cls._browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ignore_https_errors=True,
-        )
-        page = context.new_page()
-        captured_url = None
-        full_url = chapter_url if chapter_url.startswith("http") else f"{BASE_URL}{chapter_url}"
-
-        try:
-            def handle_route(route, request):
-                nonlocal captured_url
-                url = request.url
-                rtype = request.resource_type
-
-                # mangafire.to ajax/read requests
-                if "mangafire.to" in url and "/ajax/read/" in url:
-                    if "/ajax/read/chapter/" in url or "/ajax/read/volume/" in url:
-                        if not captured_url:
-                            captured_url = url
-                        route.abort()          # Capture — don't need the response
-                    else:
-                        route.continue_()      # Allow (VRF generation flow)
-                    return
-
-                # mangafire.to — allow everything except images (Kotlin: blockNetworkImage)
-                if "mangafire.to" in url:
-                    route.abort() if rtype in ("image", "media", "font") else route.continue_()
-                    return
-
-                # CDN scripts
-                if "mfcdn.cc" in url:
-                    route.abort() if rtype in ("image", "media", "font") else route.continue_()
-                    return
-
-                # jQuery from cloudflare
-                if "cloudflare.com" in url and "jquery" in url.lower():
-                    route.continue_()
-                    return
-
-                # Block everything else
-                route.abort()
-
-            page.route("**/*", handle_route)
-            page.goto(full_url, wait_until="networkidle", timeout=30000)
-
-            # Wait up to 10s for the AJAX request to fire
-            for _ in range(20):
-                if captured_url:
-                    break
-                page.wait_for_timeout(500)
-
-        except PlaywrightTimeout:
-            logger.warning(f"[VRF] Timeout loading {full_url}")
-        except Exception as e:
-            logger.error(f"[VRF] Error: {e}")
-        finally:
-            context.close()
-
-        return captured_url
-
-    @classmethod
-    def _get_page_with_cloudflare_bypass_sync(cls, url: str) -> str:
-        """Blocking Cloudflare-bypass page fetch."""
-        cls._ensure_browser_sync()
-        page = cls._context.new_page()
-        try:
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            return page.content()
-        except Exception as e:
-            raise RuntimeError(f"Browser fetch failed: {e}")
-        finally:
-            page.close()
-
-    # ---- public async interface (delegates to thread) ----
-
-    @classmethod
-    async def get_browser(cls):
-        """Ensure browser is started (async wrapper)."""
-        if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
-            )
-        await asyncio.to_thread(cls._ensure_browser_sync)
-        return cls._browser, cls._context
-
-    @classmethod
-    async def close_browser(cls):
-        """Close browser instance (async wrapper)."""
-        await asyncio.to_thread(cls._close_browser_sync)
-
-    @classmethod
-    async def get_search_vrf(cls, query: str) -> str:
-        """Get VRF token for a search query (async wrapper)."""
-        if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
-            )
-        if query in cls._search_vrf_cache:
-            return cls._search_vrf_cache[query]
-        return await asyncio.to_thread(cls._get_search_vrf_sync, query)
+    # ---- chapter pages VRF ----
 
     @classmethod
     async def get_chapter_pages_vrf(cls, chapter_url: str) -> str:
         """
-        Get VRF-protected AJAX URL for chapter pages (async wrapper).
-        Returns the intercepted AJAX URL with VRF token, matching Kotlin behavior.
+        Capture the VRF-protected AJAX URL for chapter pages.
+
+        Mirrors Kotlin fetchPageList + WebViewHelper.loadInWebView:
+          1. Load chapter page in browser.
+          2. Passively monitor requests via page.on("request").
+          3. Capture the first ajax/read/chapter/{id}?vrf=… or
+             ajax/read/volume/{id}?vrf=… URL.
+
+        Uses page.on("request") instead of page.route() because route
+        callbacks break the JS execution chain needed for the VRF AJAX
+        cascade (the first ajax/read/…/chapter/… request triggers a
+        second ajax/read/chapter/{id}?vrf=… that we actually need).
+
+        Retries once (Cloudflare challenge on cold start).
         """
         if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
+            raise HTTPException(status_code=501, detail="Playwright not installed")
+
+        await cls._ensure_browser()
+        full_url = chapter_url if chapter_url.startswith("http") else f"{BASE_URL}{chapter_url}"
+
+        for attempt in range(2):
+            # Fresh context with cookies from the shared context.
+            # This gives us: no stale HTTP cache + Cloudflare cookies.
+            # Matches Kotlin: new WebView per call, cookies via OkHttpClient.
+            storage = await cls._context.storage_state()
+            ctx = await cls._browser.new_context(
+                storage_state=storage,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
             )
-        return await asyncio.to_thread(cls._get_chapter_pages_vrf_sync, chapter_url)
+            page = await ctx.new_page()
+            captured_url = None
+
+            try:
+                def handle_request(request):
+                    nonlocal captured_url
+                    url = request.url
+                    if "mangafire.to" in url and "/ajax/read/" in url:
+                        if ("/ajax/read/chapter/" in url or "/ajax/read/volume/" in url) \
+                                and not captured_url:
+                            captured_url = url
+
+                page.on("request", handle_request)
+                await page.goto(full_url, wait_until="networkidle", timeout=45000)
+
+                # Poll a little more in case the request fires just after networkidle
+                for _ in range(10):
+                    if captured_url:
+                        break
+                    await page.wait_for_timeout(500)
+
+            except PlaywrightTimeout:
+                logger.warning(f"[VRF] Timeout loading {full_url} (attempt {attempt + 1})")
+            except Exception as e:
+                logger.error(f"[VRF] Error (attempt {attempt + 1}): {e}")
+            finally:
+                # Copy any new cookies (e.g. Cloudflare clearance) back to shared context
+                try:
+                    for cookie in await ctx.cookies():
+                        await cls._context.add_cookies([cookie])
+                except Exception:
+                    pass
+                await page.close()
+                await ctx.close()
+
+            if captured_url:
+                return captured_url
+
+        return None
+
+    # ---- convenience wrappers (kept for backward compat) ----
 
     @classmethod
-    async def get_page_with_cloudflare_bypass(cls, url: str) -> str:
-        """Fetch a page with Cloudflare bypass (async wrapper)."""
+    async def get_browser(cls):
+        """Ensure browser is started."""
         if not PLAYWRIGHT_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="Playwright not installed. Run: pip install playwright && playwright install chromium"
-            )
-        try:
-            return await asyncio.to_thread(cls._get_page_with_cloudflare_bypass_sync, url)
-        except RuntimeError as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=501, detail="Playwright not installed")
+        await cls._ensure_browser()
+        return cls._browser, cls._context
 
 
 # ==================== API Client ====================
