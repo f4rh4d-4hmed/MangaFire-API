@@ -1,11 +1,14 @@
 """
-Test suite for MangaFire API
-Tests search, language selection, chapters, and pages functionality
+Test suite for the MangaFire API.
 
-Run with:
-  pytest test_api.py -v          # Run as pytest tests
-  python test_api.py             # Run as standalone script with live API requests
-  python test_api.py --live      # Run live tests against running server
+Covers root/info endpoints, search (with filters, pagination, sort),
+manga details, chapters, pages, error handling, and end-to-end workflows.
+
+Run modes:
+  pytest test_api.py -v                # In-process via FastAPI TestClient
+  python test_api.py                   # Live HTTP tests against a running server
+  python test_api.py --live            # (same as above)
+  python test_api.py --pytest          # Explicitly invoke pytest from the script
 """
 
 import pytest
@@ -13,14 +16,14 @@ import sys
 import json
 from typing import Optional
 
-# Try importing requests for live tests
+# ── Optional: requests (live HTTP tests) ──────────────────────────────
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
 
-# Try importing FastAPI test client for pytest tests
+# ── Optional: FastAPI TestClient (in-process pytest tests) ─────────────
 try:
     from fastapi.testclient import TestClient
     from app import app, SUPPORTED_LANGUAGES, GENRES, SortOrder
@@ -30,17 +33,17 @@ except ImportError:
     FASTAPI_AVAILABLE = False
     test_client = None
 
-# Configuration
+# Base URL for live-server tests
 LIVE_API_URL = "http://127.0.0.1:8000"
 
 
-# ==================== Pytest Test Classes ====================
+# ==================== Pytest Test Classes (in-process via TestClient) ====================
 
 class TestRootEndpoints:
-    """Test root and info endpoints"""
+    """Verify root (/) and informational endpoints (/languages, /genres, etc.)."""
     
     def test_root_endpoint(self):
-        """Test root endpoint returns API info"""
+        """Root returns API name, version, and endpoint catalogue."""
         response = test_client.get("/")
         assert response.status_code == 200
         data = response.json()
@@ -51,7 +54,7 @@ class TestRootEndpoints:
         assert "browser_available" in data
     
     def test_languages_endpoint(self):
-        """Test languages endpoint"""
+        """Languages list includes en, ja, es at minimum."""
         response = test_client.get("/languages")
         assert response.status_code == 200
         data = response.json()
@@ -63,7 +66,7 @@ class TestRootEndpoints:
         assert "es" in data["languages"]
     
     def test_genres_endpoint(self):
-        """Test genres endpoint"""
+        """Genre list contains well-known entries."""
         response = test_client.get("/genres")
         assert response.status_code == 200
         data = response.json()
@@ -73,7 +76,7 @@ class TestRootEndpoints:
         assert "romance" in data["genres"]
     
     def test_sort_options_endpoint(self):
-        """Test sort options endpoint"""
+        """Sort options include at least most_viewed and recently_updated."""
         response = test_client.get("/sort-options")
         assert response.status_code == 200
         data = response.json()
@@ -82,7 +85,7 @@ class TestRootEndpoints:
         assert "recently_updated" in data["sort_options"]
     
     def test_browser_status_endpoint(self):
-        """Test browser status endpoint"""
+        """Browser status reports Playwright availability and cache size."""
         response = test_client.get("/browser/status")
         assert response.status_code == 200
         data = response.json()
@@ -92,10 +95,10 @@ class TestRootEndpoints:
 
 
 class TestSearchEndpoint:
-    """Test search functionality"""
+    """Search / browse endpoint (/search) with various filter combinations."""
     
     def test_search_basic(self):
-        """Test basic search without query"""
+        """Browse mode (no keyword) returns a paginated manga list."""
         response = test_client.get("/search")
         assert response.status_code == 200
         data = response.json()
@@ -105,9 +108,9 @@ class TestSearchEndpoint:
         assert isinstance(data["manga_list"], list)
     
     def test_search_with_query(self):
-        """Test search with keyword"""
+        """Keyword search (browser bypass disabled) returns results or a protected-access error."""
         response = test_client.get("/search", params={"query": "Boruto", "use_browser": "false"})
-        # Note: Keyword search may return 403 due to Cloudflare protection
+        # Keyword search without VRF may return 403 (Cloudflare) or 500
         assert response.status_code in [200, 403, 500]
         if response.status_code == 200:
             data = response.json()
@@ -119,7 +122,7 @@ class TestSearchEndpoint:
                 assert "url" in manga
     
     def test_search_with_language(self):
-        """Test search with language filter"""
+        """Search accepts different language codes without error."""
         for lang in ["en", "ja", "es"]:
             response = test_client.get("/search", params={"language": lang})
             assert response.status_code == 200
@@ -127,7 +130,7 @@ class TestSearchEndpoint:
             assert "manga_list" in data
     
     def test_search_with_pagination(self):
-        """Test search pagination"""
+        """Pages 1 and 2 return distinct current_page values."""
         response_page1 = test_client.get("/search", params={"page": 1})
         response_page2 = test_client.get("/search", params={"page": 2})
         
@@ -141,34 +144,34 @@ class TestSearchEndpoint:
         assert data2["current_page"] == 2
     
     def test_search_with_sort(self):
-        """Test search with different sort options"""
+        """Various sort orders are accepted."""
         for sort in ["most_viewed", "recently_updated", "trending"]:
             response = test_client.get("/search", params={"sort": sort})
             assert response.status_code == 200
     
     def test_search_with_genres(self):
-        """Test search with genre filter"""
+        """Genre filter (comma-separated) is accepted."""
         response = test_client.get("/search", params={"genres": "action,adventure"})
         assert response.status_code == 200
         data = response.json()
         assert "manga_list" in data
     
     def test_search_with_type(self):
-        """Test search with type filter"""
+        """Type filter (manga, manhwa, etc.) is accepted."""
         response = test_client.get("/search", params={"types": "manga"})
         assert response.status_code == 200
         data = response.json()
         assert "manga_list" in data
     
     def test_search_with_status(self):
-        """Test search with status filter"""
+        """Status filter (completed, releasing, etc.) is accepted."""
         response = test_client.get("/search", params={"status": "completed"})
         assert response.status_code == 200
         data = response.json()
         assert "manga_list" in data
     
     def test_search_combined_filters(self):
-        """Test search with multiple filters"""
+        """Multiple filters can be combined in a single request."""
         response = test_client.get("/search", params={
             "language": "en",
             "genres": "action",
@@ -181,69 +184,69 @@ class TestSearchEndpoint:
 
 
 class TestMangaDetailsEndpoint:
-    """Test manga details functionality"""
+    """Manga details endpoint (/manga/{manga_id})."""
     
     def test_manga_details_invalid_id(self):
-        """Test manga details with invalid ID"""
+        """Slug with no numeric component returns 400."""
         response = test_client.get("/manga/invalid-no-numbers")
         assert response.status_code == 400
         data = response.json()
         assert "error" in data
     
     def test_manga_details_not_found(self):
-        """Test manga details with non-existent ID"""
+        """Non-existent manga returns 404 or 500."""
         response = test_client.get("/manga/nonexistent.999999")
         assert response.status_code in [404, 500]
 
 
 class TestChaptersEndpoint:
-    """Test chapters functionality"""
+    """Chapters endpoint (/manga/{manga_id}/chapters)."""
     
     def test_chapters_invalid_manga(self):
-        """Test chapters with invalid manga ID"""
+        """Non-existent manga ID returns 404 or 500."""
         response = test_client.get("/manga/invalid.999999/chapters")
         assert response.status_code in [404, 500]
     
     def test_chapters_with_language(self):
-        """Test chapters with language parameter"""
+        """Language parameter is forwarded correctly (error expected for bad ID)."""
         response = test_client.get("/manga/invalid.999999/chapters", params={"language": "ja"})
         assert response.status_code in [404, 500]
     
     def test_chapters_volume_type(self):
-        """Test chapters with volume type"""
+        """Volume-type chapter list is accepted (error expected for bad ID)."""
         response = test_client.get("/manga/invalid.999999/chapters", params={"type": "volume"})
         assert response.status_code in [404, 500]
 
 
 class TestPagesEndpoint:
-    """Test pages functionality"""
+    """Pages endpoint (/chapter/{chapter_id}/pages)."""
     
     def test_pages_invalid_chapter(self):
-        """Test pages with invalid chapter ID"""
+        """Invalid chapter path returns an error (various codes depending on Playwright state)."""
         response = test_client.get("/chapter/invalid/pages")
         assert response.status_code in [400, 403, 404, 500, 501]
 
 
 class TestErrorHandling:
-    """Test error handling"""
+    """Validate error responses (format, status codes)."""
     
     def test_invalid_endpoint(self):
-        """Test non-existent endpoint"""
+        """Unknown path returns 404."""
         response = test_client.get("/nonexistent")
         assert response.status_code == 404
     
     def test_invalid_page_number(self):
-        """Test invalid page number"""
+        """Page number 0 is rejected (ge=1 validation)."""
         response = test_client.get("/search", params={"page": 0})
         assert response.status_code == 422
     
     def test_invalid_page_negative(self):
-        """Test negative page number"""
+        """Negative page number is rejected."""
         response = test_client.get("/search", params={"page": -1})
         assert response.status_code == 422
     
     def test_error_response_format(self):
-        """Test error response format"""
+        """Error body contains error, detail, and status_code keys."""
         response = test_client.get("/manga/invalid-no-numbers")
         assert response.status_code == 400
         data = response.json()
@@ -253,10 +256,10 @@ class TestErrorHandling:
 
 
 class TestIntegration:
-    """Integration tests - Full workflow"""
+    """Multi-step integration workflows (search → details → chapters)."""
     
     def test_search_select_get_chapters_flow(self):
-        """Test: Search -> Select manga -> Get chapters"""
+        """Search browse → pick first result → verify it has an ID and title."""
         # Step 1: Search
         search_response = test_client.get("/search", params={
             "sort": "most_viewed",
@@ -271,7 +274,7 @@ class TestIntegration:
             assert manga["title"] is not None
     
     def test_language_selection_workflow(self):
-        """Test language selection across search"""
+        """Search with each supported language returns 200."""
         languages_response = test_client.get("/languages")
         languages = languages_response.json()["languages"]
         
@@ -284,10 +287,10 @@ class TestIntegration:
 
 
 class TestModelValidation:
-    """Test model validation"""
+    """Verify Pydantic response models have the expected fields and types."""
     
     def test_search_result_model(self):
-        """Test SearchResult model fields"""
+        """SearchResult JSON has manga_list (list), has_next_page (bool), current_page (int)."""
         response = test_client.get("/search")
         assert response.status_code == 200
         data = response.json()
@@ -301,7 +304,7 @@ class TestModelValidation:
         assert isinstance(data["current_page"], int)
     
     def test_manga_basic_model(self):
-        """Test MangaBasic model fields"""
+        """MangaBasic items have id, title, url as strings."""
         response = test_client.get("/search")
         data = response.json()
         
@@ -316,12 +319,10 @@ class TestModelValidation:
 
 
 class TestBorutoVortexWorkflow:
-    """
-    Complete workflow test: Search, select, get chapters, get pages
-    """
+    """End-to-end smoke test: browse → select → sel chapters → pages."""
     
     def test_full_workflow(self):
-        """End-to-end test workflow"""
+        """Browse most-viewed, pick first manga, confirm it has chapters."""
         # Step 1: Search
         search_response = test_client.get("/search", params={
             "sort": "most_viewed",
@@ -339,17 +340,17 @@ class TestBorutoVortexWorkflow:
         assert len(search_data["manga_list"]) > 0
 
 
-# ==================== Live API Tests (for running with python directly) ====================
+# ==================== Live API Tests (HTTP requests against a running server) ====================
 
 def print_header(title: str):
-    """Print a formatted header"""
+    """Print a section header with surrounding separators."""
     print("\n" + "=" * 70)
     print(f" {title}")
     print("=" * 70)
 
 
 def print_json(data, indent=2, max_items=3):
-    """Print JSON data with optional truncation"""
+    """Pretty-print JSON, truncating long lists to *max_items* entries."""
     if isinstance(data, dict):
         # Truncate lists in the response
         truncated = {}
@@ -364,7 +365,7 @@ def print_json(data, indent=2, max_items=3):
 
 
 def test_live_root():
-    """Test root endpoint"""
+    """GET / – API index."""
     print_header("1. Root Endpoint - GET /")
     response = requests.get(f"{LIVE_API_URL}/")
     print(f"Status: {response.status_code}")
@@ -373,7 +374,7 @@ def test_live_root():
 
 
 def test_live_languages():
-    """Test languages endpoint"""
+    """GET /languages – supported language list."""
     print_header("2. Languages Endpoint - GET /languages")
     response = requests.get(f"{LIVE_API_URL}/languages")
     print(f"Status: {response.status_code}")
@@ -382,7 +383,7 @@ def test_live_languages():
 
 
 def test_live_genres():
-    """Test genres endpoint"""
+    """GET /genres – available genre names."""
     print_header("3. Genres Endpoint - GET /genres")
     response = requests.get(f"{LIVE_API_URL}/genres")
     print(f"Status: {response.status_code}")
@@ -393,7 +394,7 @@ def test_live_genres():
 
 
 def test_live_sort_options():
-    """Test sort options endpoint"""
+    """GET /sort-options – available sort-order values."""
     print_header("4. Sort Options Endpoint - GET /sort-options")
     response = requests.get(f"{LIVE_API_URL}/sort-options")
     print(f"Status: {response.status_code}")
@@ -402,7 +403,7 @@ def test_live_sort_options():
 
 
 def test_live_browser_status():
-    """Test browser status endpoint"""
+    """GET /browser/status – Playwright availability and VRF cache stats."""
     print_header("5. Browser Status Endpoint - GET /browser/status")
     response = requests.get(f"{LIVE_API_URL}/browser/status")
     print(f"Status: {response.status_code}")
@@ -411,7 +412,7 @@ def test_live_browser_status():
 
 
 def test_live_search_browse():
-    """Test search in browse mode"""
+    """GET /search (browse mode) – most-viewed English manga."""
     print_header("6. Search (Browse Mode) - GET /search?sort=most_viewed&language=en")
     response = requests.get(f"{LIVE_API_URL}/search", params={
         "sort": "most_viewed",
@@ -429,7 +430,7 @@ def test_live_search_browse():
 
 
 def test_live_search_with_filters():
-    """Test search with filters"""
+    """GET /search with genre + status + sort filters."""
     print_header("7. Search with Filters - GET /search?genres=action&status=completed")
     response = requests.get(f"{LIVE_API_URL}/search", params={
         "genres": "action",
@@ -448,7 +449,7 @@ def test_live_search_with_filters():
 
 
 def test_live_search_pagination():
-    """Test search pagination"""
+    """Pages 1 and 2 return different result sets."""
     print_header("8. Search Pagination - GET /search?page=1 vs page=2")
     
     response1 = requests.get(f"{LIVE_API_URL}/search", params={"page": 1})
@@ -472,7 +473,7 @@ def test_live_search_pagination():
 
 
 def test_live_chapters():
-    """Test chapters - Search -> Select first -> Get languages -> Get chapters -> Get pages"""
+    """Dynamic workflow: search → select first manga → get chapters → get pages."""
     print_header("9. Dynamic Chapter Test")
     
     # Step 1: Search (simple, no filters)
@@ -548,7 +549,7 @@ def test_live_chapters():
 
 
 def test_live_chapters_with_language(language: str = "ja"):
-    """Test chapters with different language"""
+    """Get chapters in a non-default language."""
     print_header(f"10. Get Chapters (Language: {language})")
     
     # Search and get first manga
@@ -577,7 +578,7 @@ def test_live_chapters_with_language(language: str = "ja"):
 
 
 def test_live_pages():
-    """Test pages - search, get chapters, get pages"""
+    """Search → first manga → first chapter → get pages (retries once on cold browser)."""
     print_header("11. Get Pages (Dynamic)")
     
     # Search and get first manga
@@ -616,7 +617,7 @@ def test_live_pages():
 
 
 def test_live_error_invalid_manga():
-    """Test error handling for invalid manga"""
+    """GET /manga/{bad-slug} – expect 400."""
     print_header("12. Error Test - Invalid Manga ID")
     response = requests.get(f"{LIVE_API_URL}/manga/invalid-no-numbers")
     print(f"Status: {response.status_code}")
@@ -625,7 +626,7 @@ def test_live_error_invalid_manga():
 
 
 def test_live_error_not_found():
-    """Test error handling for not found"""
+    """GET /manga/{nonexistent} – expect 404 or 500."""
     print_header("13. Error Test - Manga Not Found")
     response = requests.get(f"{LIVE_API_URL}/manga/nonexistent.999999")
     print(f"Status: {response.status_code}")
@@ -634,7 +635,7 @@ def test_live_error_not_found():
 
 
 def test_live_error_invalid_chapter():
-    """Test error handling for invalid chapter"""
+    """GET /chapter/{bad-path}/pages – expect an error status."""
     print_header("14. Error Test - Invalid Chapter URL")
     response = requests.get(f"{LIVE_API_URL}/chapter/invalid/pages")
     print(f"Status: {response.status_code}")
@@ -643,7 +644,7 @@ def test_live_error_invalid_chapter():
 
 
 def test_live_full_workflow():
-    """Test complete workflow: Search -> Select -> Chapters -> Pages"""
+    """Full pipeline: search → select manga → list languages → get chapters → get pages."""
     print_header("15. FULL WORKFLOW TEST")
     print("Search -> Select Manga -> List Languages -> Get Chapters -> Get Pages")
     print("-" * 70)
@@ -741,7 +742,7 @@ def test_live_full_workflow():
 
 
 def run_live_tests():
-    """Run all live API tests"""
+    """Execute all live tests sequentially and print a summary table."""
     print("\n")
     print("╔" + "═" * 68 + "╗")
     print("║" + " MangaFire API - Live Test Suite ".center(68) + "║")
@@ -825,7 +826,7 @@ def run_live_tests():
 
 
 def run_pytest():
-    """Run pytest tests"""
+    """Invoke pytest programmatically on this file."""
     print("=" * 60)
     print("MangaFire API Test Suite (pytest)")
     print("=" * 60)
