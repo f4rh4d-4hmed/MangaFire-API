@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+Update from KT/Filters.kt
+Update from KT/ImageInterceptor.kt
+Update from KT/MangaFire.kt
+Update from KT/MangaFireFactory.kt
+Update from KT/WebViewHelper.kt
+.gitignore
